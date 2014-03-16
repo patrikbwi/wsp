@@ -1,0 +1,11 @@
+{application, wsp,
+ [
+  {description, "native api to 1080 wather station"},
+  {vsn, git},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { wsp_app, []}}
+ ]}.
