@@ -14,6 +14,9 @@
 %% API
 -export([start_link/1, 
 	 stop/0,
+	 subscribe/0,
+	 subscribe/1,
+	 unsubscribe/1
         ]).
 
 %% gen_server callbacks
@@ -24,7 +27,37 @@
 	 terminate/2, 
 	 code_change/3]).
 
+%% Testing
+-export([version/0,
+	 setopt/1]).
+
 -define(SERVER, ?MODULE). 
+
+-record(subscription,
+	{
+	  pid,
+	  mon,
+	  pattern
+	}).
+
+-record(ctx, 
+	{
+	  handle,         %% serial port / net socket / undefined
+	  device,         %% device string (for net = code )
+	  variant,        %% stick/duo/net  stick|duo|net|simulated
+	  version,        %% first version if detected
+	  command,        %% last command
+	  client,         %% last client
+	  queue,          %% request queue
+	  reply_timer,    %% timeout waiting for reply
+	  reopen_ival,    %% interval betweem open retry 
+	  reopen_timer,   %% timer ref
+	  subs = []      %% #subscription{}
+	}).
+
+%% For dialyzer
+-type start_options()::{device, Device::string()} |
+		       {retry_timeout, TimeOut::timeout()}.
 
 %%%===================================================================
 %%% API
@@ -60,19 +93,6 @@ start_link(Opts) ->
 stop() ->
     gen_server:call(?SERVER, stop).
 
-
-%%--------------------------------------------------------------------
-%% @doc
-%% Subscribe to wsp events.
-%%
-%% @end
-%%--------------------------------------------------------------------
--spec subscribe(Pattern::[{atom(),string()}]) ->
-		       {ok,reference()} | {error, Error::term()}.
-subscribe(Pattern) ->
-    gen_server:call(?SERVER, {subscribe,self(),Pattern}).
-
-
 %%--------------------------------------------------------------------
 %% @doc
 %% Subscribe to wsp events.
@@ -81,7 +101,12 @@ subscribe(Pattern) ->
 %%--------------------------------------------------------------------
 -spec subscribe() -> {ok,reference()} | {error, Error::term()}.
 subscribe() ->
-    gen_server:call(?SERVER, {subscribe,self(),[]}).
+    subscribe([]).
+
+-spec subscribe(Pattern::[{atom(),string()}]) ->
+		       {ok,reference()} | {error, Error::term()}.
+subscribe(Pattern) ->
+    gen_server:call(?SERVER, {subscribe,self(),Pattern}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -159,9 +184,8 @@ open(Ctx=#ctx {device = DeviceName, variant=Variant,
 	    Error
     end.
 
-close(Ctx=#ctx {handle = U, variant = V})
-  when is_port(U), ((V =:= stick) orelse ((V =:= duo))) ->
-    lager:debug("tellstick ~w close: ~p", [U,V]),
+close(Ctx=#ctx {handle = U}) when is_port(U) ->
+    lager:debug("wsp ~w close", [U]),
     uart:close(U),
     {ok, Ctx#ctx { handle=undefined }};
 close(Ctx) ->
@@ -175,12 +199,15 @@ close(Ctx) ->
 %% @end
 %%--------------------------------------------------------------------
 
+-type call_request()::
+        stop.
+
 -spec handle_call(Request::call_request(), From::{pid(), Tag::term()}, Ctx::#ctx{}) ->
 			 {reply, Reply::term(), Ctx::#ctx{}} |
 			 {noreply, Ctx::#ctx{}} |
 			 {stop, Reason::atom(), Reply::term(), Ctx::#ctx{}}.
 
-handle_call({subscribe,Pid,Pattern},_From,Ctx=#ctx { subs=Subs}) ->
+handle_call({subscribe,Pid,Pattern},_From,Ctx=#ctx{ subs=Subs}) ->
     Mon = erlang:monitor(process, Pid),
     Subs1 = [#subscription { pid = Pid, mon = Mon, pattern = Pattern}|Subs],
     {reply, {ok,Mon}, Ctx#ctx { subs = Subs1}};
@@ -198,6 +225,9 @@ handle_call(version, _From, Ctx) ->
 handle_call(stop, _From, Ctx) ->
     {stop, normal, ok, Ctx}.
 
+handle_call_(_Request, _From, Ctx) ->
+    {reply, {error,bad_call}, Ctx}.
+
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -211,7 +241,7 @@ handle_call(stop, _From, Ctx) ->
 
 handle_cast({setopt, {Option, Value}}, Ctx=#ctx { handle = U}) ->
     lager:debug("handle_cast: setopt ~p = ~p", [Option, Value]),
-    uart:setopt(U, Option, Value);
+    uart:setopt(U, Option, Value),
     {noreply, Ctx};
 handle_cast(Cast, Ctx=#ctx { handle = U, client=Client})
   when U =/= undefined, Client =/= undefined ->
@@ -413,287 +443,3 @@ match_event([{Key,ValuePat}|Kvs],Event) ->
 	_ -> false
     end.
 
-
--define(NEXA_0, [320,960,320,960]).  %% zero bit
--define(NEXA_1, [960,320,960,320]).  %% one bit  (not used?)
--define(NEXA_X, [320,960,960,320]).  %% open bit
--define(NEXA_S, [320,1250]).         %% sync bit
-
--define(NEXA_ON_BIT,  16#800).
--define(NEXA_BIT_4,   16#400). %% ?
--define(NEXA_BIT_2,   16#200). %% ?
--define(NEXA_BIT_1,   16#100). %% ?
-
--define(NEXA_BELL,   16#F00).
--define(NEXA_ON,     16#E00).
--define(NEXA_OFF,    16#600).
--define(WAVEMAN_OFF, 16#000).
-
-%% @private
-waveman_command(HouseCode, Channel, On) ->
-    nexa_command(HouseCode, Channel, On, true).
-
-%% @private
-nexa_command(HouseCode, Channel, On) ->
-    nexa_command(HouseCode, Channel, On, false).
-
-%% @private
-nexa_command(HouseCode, Channel, On, WaveMan) when
-      HouseCode >= $A, HouseCode =< $P,
-      Channel >= 1, Channel =< 16, (is_boolean(On) orelse On =:= bell) ->
-    Channel1 = if On =:= bell -> 7;
-		  true -> Channel - 1
-	       end,
-    TxCode0 = (Channel1 bsl 4) bor (HouseCode-$A),
-    TxCode = if  On =:= bell ->
-		     TxCode0 bor ?NEXA_BELL;
-		 On =:= true ->
-		     TxCode0 bor ?NEXA_ON;
-		WaveMan, On =:= false ->
-		     TxCode0 bor ?WAVEMAN_OFF;
-		true ->
-		     TxCode0 bor ?NEXA_OFF
-	     end,
-    nexa_rf_code(TxCode, 12) ++ ?NEXA_S.
-
-nexa_rf_code(Code, N) ->
-    rf_code_lh(Code, N, ?NEXA_0, ?NEXA_X). 
-
--define(T00, 1270).
--define(T01, 2550).
--define(T10, 240).
--define(T11, 10).
-
--define(NEXAX_0, [?T10,?T10,?T10,?T00]).  %% zero bit
--define(NEXAX_1, [?T10,?T00,?T10,?T10]).  %% open bit
--define(NEXAX_D, [?T10,?T10,?T10,?T10]).  %% one bit
--define(NEXAX_S, [?T10,?T01]).            %% start bit
--define(NEXAX_P, [?T10]).                 %% pad?
-
-%%  "1" => 1000 = [240,1270]
-%%  "0" => 1010 = [240,240]
-%%  X  ==  "10" => 10001010 = [240,1270,240,240]
-%%  Z  == "01" => 10101000 = [240,240,240,1270]
-%%  1  == "00" => 10101010 = [240,240,240,240]
-%%  "11" => not used
-
-%% @private
-nexax_command(Serial, Channel, Level) when
-      Serial >= 0, Serial =< 16#3ffffff,
-      Channel >= 1, Channel =< 16, 
-      (is_boolean(Level) orelse (Level =:= bell) 
-       orelse (is_integer(Level) andalso (Level >= 0)
-	       andalso (Level =< 255))) ->
-    Channel1 = if Level =:= bell -> 7;
-		  true -> Channel - 1
-	       end,
-    ?NEXAX_S ++
-    nexax_rf_code(Serial, 26) ++
-	?NEXAX_0 ++  %% Group
-	if is_integer(Level) ->
-		?NEXAX_D;
-	   Level =:= false ->
-		?NEXAX_0;
-	   Level =:= true ->
-		?NEXAX_1;
-	   Level =:= bell ->
-		?NEXAX_1
-	end ++
-	nexax_rf_code(Channel1, 4) ++
-	if is_integer(Level) ->
-		nexax_rf_code(Level div 16, 4) ++
-		    ?NEXAX_P;
-	   true ->
-		?NEXAX_P
-	end.
-    
-nexax_rf_code(Code, N) ->      
-    rf_code_hl(Code, N, ?NEXAX_0, ?NEXAX_1). 
-    
-
-
--define(SARTANO_0, [360,1070,1070,360]). %% $kk$
--define(SARTANO_1, [360,1070,360,1070]). %% $k$k
--define(SARTANO_X, []).
--define(SARTANO_S, [360,1070]).  %% $k
-
-%% @private
-sartano_command(Channel, On) when
-      Channel >= 1, Channel =< 10, is_boolean(On) ->
-    sartano_multi_command((1 bsl (Channel-1)), On).
-
-%% Hmm high bit is first channel?
-sartano_multi_command(ChannelMask, On) when
-      ChannelMask >= 0, ChannelMask =< 16#3FF, is_boolean(On) ->
-    ChannelBits = reverse_bits(ChannelMask, 10),
-    if On ->
-	    sartano_rf_code(ChannelBits,10) ++
-		sartano_rf_code(2#01, 2) ++ ?SARTANO_S;
-       true ->
-	    sartano_rf_code(ChannelBits,10) ++ 
-		sartano_rf_code(2#10, 2) ++ ?SARTANO_S
-    end.
-
-sartano_rf_code(Code, N) ->
-    rf_code_lh(Code, N, ?SARTANO_0, ?SARTANO_1).
-
-		
--define(IKEA_0, [1700]).    %% high or low 
--define(IKEA_1, [840,840]). %% toggle  TT
-%%
-%% Looks like channel code is a bit mask!!! multiple channels at once!!!?
-%% Note: this is normalized to send b0 first!
-%% DimStyle: 0  Instant
-%%         : 1  Smooth
-%%
-%% @private
-ikea_command(System, Channel, DimLevel, DimStyle) when 
-      System >= 1, System =< 16 andalso
-      Channel >= 1, Channel =< 10 andalso
-      DimLevel >= 0, DimLevel =< 10 andalso
-      (DimStyle =:= 0 orelse DimStyle =:= 1) ->
-    ChannelCode = Channel rem 10,
-    IntCode0 = (1 bsl (ChannelCode+4)) bor reverse_bits(System-1,4),
-    IntFade = (DimStyle*2 + 1) bsl 4,   %% 1 or 3 bsl 4
-    IntCode1 = if DimLevel =:= 0 ->  10 bor IntFade;
-		  DimLevel =:= 10 -> 0 bor IntFade;
-		  true -> DimLevel bor IntFade
-	       end,
-    ikea_rf_code(2#0111, 4) ++
-	ikea_rf_code(IntCode0, 14) ++
-	ikea_rf_code(checksum_bits(IntCode0, 14), 2) ++
-	ikea_rf_code(IntCode1, 6) ++
-	ikea_rf_code(checksum_bits(IntCode1, 6), 2).
-
-%% Low to high bits
-ikea_rf_code(Code, N) ->
-    rf_code_lh(Code, N, ?IKEA_0, ?IKEA_1).
-
-%% Two bit toggle checksum 
-checksum_bits(Bits, N) ->
-    checksum_bits(Bits, N, 0).
-
-checksum_bits(_Bits, I, CSum) when I =< 0 -> 
-    CSum bxor 3;  %% invert
-checksum_bits(Bits, I, CSum) ->
-    checksum_bits(Bits bsr 2, I-2, CSum bxor (Bits band 3)).
-
-    
--define(RISING_0, [1010, 460, 460, 1010]).  %% e..e
--define(RISING_1, [460, 1010, 460, 1010]).  %% .e.e
--define(RISING_S, [460, 1010]).
-%%
-%% I guess that rising sun can send bit patterns on both code and unit
-%% This is coded for one code/unit only
-%%
-%% @private
-risingsun_command(Code, Unit, On) when
-      Code >= 1, Code =< 4, Unit >= 1, Unit =< 4, is_boolean(On) ->
-    risingsun_multi_command((1 bsl (Code-1)), (1 bsl (Unit-1)), On).
-
-risingsun_multi_command(Codes, Units, On) when
-      Codes >= 0, Codes =< 15, Units >= 0, Units =< 15, is_boolean(On) ->
-    ?RISING_S ++ 
-	risingsun_rf_code(Codes,4) ++
-	risingsun_rf_code(Units,4) ++
-	if On ->
-		risingsun_rf_code(2#0000, 4);
-	   true ->
-		risingsun_rf_code(2#1000, 4)
-	end.
-
-risingsun_rf_code(Code, N) ->
-    rf_code_lh(Code, N, ?RISING_0, ?RISING_1).
-
-
-%% rf_code_lh build send list b(0) ... b(n-1)
-rf_code_lh(Code, B0, B1) ->
-    rf_code_lh(Code, 8, B0, B1).
-
-rf_code_lh(_Bits, 0, _B0, _B1) ->  
-    [];
-rf_code_lh(Bits, I, B0, B1) ->
-    if Bits band 1 =:= 1 ->
-	    B1 ++ rf_code_lh(Bits bsr 1, I-1, B0, B1);
-       true ->
-	    B0 ++ rf_code_lh(Bits bsr 1, I-1, B0, B1)
-    end.
-
-%% rf_code_hl build send list b(n-1) ... b(0)
-rf_code_hl(Code, B0, B1) ->
-    rf_code_hl(Code, 8, B0, B1).
-
-rf_code_hl(_Code, 0, _B0, _B1) ->
-    [];
-rf_code_hl(Code, I, B0, B1) ->
-    if Code band 1 =:= 1 ->
-	    rf_code_hl(Code bsr 1, I-1, B0, B1) ++ B1;
-       true ->
-	    rf_code_hl(Code bsr 1, I-1, B0, B1) ++ B0
-    end.
-
-%% reverse N bits
-reverse_bits(Bits, N) ->
-    reverse_bits_(Bits, N, 0).
-
-reverse_bits_(_Bits, 0, RBits) ->
-    RBits;
-reverse_bits_(Bits, I, RBits) ->
-    reverse_bits_(Bits bsr 1, I-1, (RBits bsl 1) bor (Bits band 1)).
-
-
-send_pulses_(_, simulated, _Data) ->
-    lager:debug("send_command: Sending data =~p\n", [_Data]),
-    {simulated, ok};
-send_pulses_(U, net, Data) ->
-    Data1 = ascii_data(Data),    
-    tellstick_net:send_pulses(U, Data1);
-send_pulses_(U, Variant, Data) when Variant =:= stick; Variant =:= duo ->
-    Data1 = ascii_data(Data),
-    N = length(Data1),
-    Command = 
-	if  N =< 60 ->
-		[?TELLSTICK_SEND, Data1, ?TELLSTICK_END];
-	    N =< 255 ->
-		[?TELLSTICK_XSEND, xcommand(Data1), ?TELLSTICK_END]
-	end,
-    Res = uart:send(U, Command),
-    {Res, Command}.
-
-
-ascii_data(Data) ->
-    [ ?US_TO_ASCII(T) || T <- lists:flatten(Data) ].
-
-%% Compress the data if possible!!!
-xcommand(Data) ->
-    xcommand(Data,0,0,0,0,<<>>).
-
-xcommand([T|Data],T0,T1,T2,T3,Bits) ->
-    if T =:= T0 ->
-	    xcommand(Data,T0,T1,T2,T3,<<Bits/bits,00:2>>);
-       T =:= T1 ->
-	    xcommand(Data,T0,T1,T2,T3,<<Bits/bits,01:2>>);
-       T =:= T2 ->
-	    xcommand(Data,T0,T1,T2,T3,<<Bits/bits,10:2>>);
-       T =:= T3 ->
-	    xcommand(Data,T0,T1,T2,T3,<<Bits/bits,11:2>>);
-       T0 =:= 0 ->
-	    xcommand(Data,T,T1,T2,T3,<<Bits/bits,00:2>>);
-       T1 =:= 0 ->
-	    xcommand(Data,T0,T,T2,T3,<<Bits/bits,01:2>>);
-       T2 =:= 0 ->
-	    xcommand(Data,T0,T1,T,T3,<<Bits/bits,10:2>>);
-       T3 =:= 0 ->
-	    xcommand(Data,T0,T1,T2,T,<<Bits/bits,11:2>>)
-    end;
-xcommand([],T0,T1,T2,T3,Bits) ->
-    Sz = bit_size(Bits),
-    Np = Sz div 2,        %% number of pulses
-    Nb = (Sz + 7) div 8,  %% number of bytes
-    R = Nb*8 - Sz,        %% pad bits
-    U0 = if T0 =:= 0 -> 1; true -> T0 end,
-    U1 = if T1 =:= 0 -> 1; true -> T1 end,
-    U2 = if T2 =:= 0 -> 1; true -> T2 end,
-    U3 = if T3 =:= 0 -> 1; true -> T3 end,
-    lager:debug("xcommand: T0=~w,T=~w,T2=~w,T3=~w,Np=~w\n", [U0,U1,U2,U3,Np]),
-    [U0,U1,U2,U3,Np | bitstring_to_list(<<Bits/bits, 0:R>>)].

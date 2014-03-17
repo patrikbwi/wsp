@@ -1,4 +1,4 @@
--module(tellstick_app).
+-module(wsp_app).
 
 -behaviour(application).
 
@@ -10,11 +10,11 @@
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
-    Options = case application:get_env(tellstick, options) of
+    Options = case application:get_env(wsp, options) of
 		  undefined -> [];
 		  {ok, O1} -> O1
 	      end,
-    tellstick_sup:start_link(Options).
+    wsp_sup:start_link(Options).
 
 stop(_State) ->
     ok.

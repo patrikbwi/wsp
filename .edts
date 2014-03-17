@@ -1,0 +1,4 @@
+:name "wsp"
+:node-sname "wsp"
+:lib-dirs '("deps" "test")
+:app-include-dirs '("include")

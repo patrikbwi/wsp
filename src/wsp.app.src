@@ -1,6 +1,6 @@
 {application, wsp,
  [
-  {description, "native api to 1080 wather station"},
+  {description, "native api to 1080 weather station"},
   {vsn, git},
   {registered, []},
   {applications, [
